@@ -1,5 +1,11 @@
+# %% [markdown]
+# # Plot profile correlations
+#
+# Plot defined correlations from notebook 1 in a single PDF.
+
+# %%
 # Load libraries
-if (!requireNamespace("BiocManager", quietly=TRUE))
+if (!requireNamespace("BiocManager", quietly = TRUE))
     install.packages("BiocManager")
 
 if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
@@ -7,15 +13,12 @@ if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
 }
 suppressPackageStartupMessages({
     library(arrow)
-    library(dplyr)
-    library(tidyr)
     library(ComplexHeatmap)
     library(circlize)
     library(grid)
 })
 
-
-
+# %%
 # Get the current working directory and find Git root
 find_git_root <- function() {
     # Get current working directory
@@ -42,149 +45,266 @@ find_git_root <- function() {
 root_dir <- find_git_root()
 
 results_dir <- file.path(root_dir, "2.2d_vs_3d_analysis", "results", "correlation")
+manifest_path <- file.path(results_dir, "correlation_manifest.parquet")
 figures_dir <- file.path(root_dir, "2.2d_vs_3d_analysis", "figures", "correlation")
+pdf_path <- file.path(figures_dir, "max_projection_pearson_correlations.pdf")
 
 dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
 
-plot_correlation_heatmap <- function(
-    corr_long_df,
-    patient_id,
-    profile_type,
-    output_path
-) {
-    #' Generate and save a clustered heatmap of Pearson correlations
-    #' between 2D and 3D features.
+# Which comparisons from the manifest to plot. NULL keeps every value.
+projections_to_plot <- "max_projection"
+profile_types_to_plot <- NULL
+cohorts_to_plot <- NULL
+
+# Number of features per block when clustering; see correlation_distances()
+distance_block_size <- 256L
+
+projection_labels <- c(
+    max_projection = "Max projection",
+    middle_slice = "Middle slice",
+    middle_n_slice = "Middle N slices"
+)
+
+# %%
+build_correlation_matrix <- function(corr_long_df, min_pairs) {
+    #' Pivot long-form correlations into a 2D x 3D matrix, blanking out any
+    #' correlation that rests on too few wells.
     #'
-    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r columns.
-    #' @param patient_id character - Patient identifier for the plot title.
-    #' @param profile_type character - Profile label (e.g., "organoid_agg", "sc_agg").
-    #' @param output_path character - File path to save the output PNG.
+    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r, n_pairs columns.
+    #' @param min_pairs numeric - Minimum finite well pairs a correlation needs to be kept.
+    #'
+    #' @return matrix - Pearson correlations with 2D features as rows and 3D features as columns.
 
-    ...
-    # Filter to patient
-    patient_data <- corr_long_df
+    # Correlations from too few wells are not trustworthy, so blank them out
+    # rather than letting them drive the colors or the clustering
+    corr_long_df$pearson_r[
+        !is.finite(corr_long_df$pearson_r) | corr_long_df$n_pairs < min_pairs
+    ] <- NA_real_
 
-    cat(sprintf(
-        "Patient %s (%s): %d rows\n",
-        patient_id, profile_type, nrow(patient_data)
-    ))
+    features_2d <- sort(unique(corr_long_df$feature_2d))
+    features_3d <- sort(unique(corr_long_df$feature_3d))
 
-    # Pivot to wide matrix: rows = 2D features, columns = 3D features
-    corr_matrix <- patient_data %>%
-        select(feature_2d, feature_3d, pearson_r) %>%
-        pivot_wider(
-            names_from = feature_3d,
-            values_from = pearson_r
-        ) %>%
-        tibble::column_to_rownames("feature_2d") %>%
-        as.matrix()
+    # These tables run to millions of rows, so the matrix is filled by cell
+    # index in one shot instead of pivoting row by row
+    corr_matrix <- matrix(
+        NA_real_,
+        nrow = length(features_2d),
+        ncol = length(features_3d),
+        dimnames = list(features_2d, features_3d)
+    )
+    corr_matrix[
+        match(corr_long_df$feature_2d, features_2d) +
+            (match(corr_long_df$feature_3d, features_3d) - 1L) * length(features_2d)
+    ] <- corr_long_df$pearson_r
 
-    # Replace NaN with 0 for clustering
-    corr_matrix[is.na(corr_matrix)] <- 0
+    # Drop features left with nothing to show; partial gaps stay blank
+    corr_matrix[
+        rowSums(is.finite(corr_matrix)) > 0L,
+        colSums(is.finite(corr_matrix)) > 0L,
+        drop = FALSE
+    ]
+}
 
-    # Color scale from blue (-1) to white (0) to red (1)
-    col_fun <- colorRamp2(
-        c(-1, 0, 1),
-        c("#2166AC", "white", "#B2182B")
+correlation_distances <- function(corr_matrix, block_size = distance_block_size) {
+    #' Calculate Euclidean distances between the rows of a correlation matrix.
+    #'
+    #' dist() would build the full pairwise matrix at once, which does not fit
+    #' for the larger profile types (thousands of features), so the distances
+    #' are accumulated from matrix products over blocks of rows instead. Every
+    #' feature is kept.
+    #'
+    #' @param corr_matrix matrix - Correlation matrix to calculate row distances for.
+    #' @param block_size integer - Number of rows per block.
+    #'
+    #' @return dist - Lower-triangle distances, as returned by dist().
+
+    n_features <- nrow(corr_matrix)
+    squared_norms <- rowSums(corr_matrix * corr_matrix)
+    distances <- numeric(n_features * (n_features - 1) / 2)
+    offset <- 0L
+
+    for (start in seq.int(1L, n_features - 1L, by = block_size)) {
+        block <- seq.int(start, min(start + block_size - 1L, n_features - 1L))
+        products <- tcrossprod(corr_matrix, corr_matrix[block, , drop = FALSE])
+
+        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2ab, clamped at 0 for rounding
+        for (j in seq_along(block)) {
+            column <- block[j]
+            rows <- seq.int(column + 1L, n_features)
+            distances[seq.int(offset + 1L, offset + length(rows))] <- sqrt(pmax(
+                squared_norms[rows] + squared_norms[column] - 2 * products[rows, j], 0
+            ))
+            offset <- offset + length(rows)
+        }
+    }
+
+    structure(
+        distances,
+        Size = n_features,
+        Labels = rownames(corr_matrix),
+        Diag = FALSE,
+        Upper = FALSE,
+        method = "euclidean",
+        class = "dist"
+    )
+}
+
+cluster_correlation_matrix <- function(corr_matrix) {
+    #' Cluster the rows of a correlation matrix with Ward linkage.
+    #'
+    #' Passed to Heatmap() for both rows and columns, which hands this the
+    #' matrix and its transpose in turn.
+    #'
+    #' @param corr_matrix matrix - Correlation matrix to cluster the rows of.
+    #'
+    #' @return hclust - Row clustering.
+
+    # Blanked correlations are treated as 0 for ordering only; they stay blank
+    # in the plot itself
+    corr_matrix[!is.finite(corr_matrix)] <- 0
+    hclust(correlation_distances(corr_matrix), method = "ward.D2")
+}
+
+# %%
+plot_correlation_heatmap <- function(corr_long_df, comparison) {
+    #' Draw a clustered heatmap of Pearson correlations between 2D and 3D
+    #' features onto the open graphics device.
+    #'
+    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r, n_pairs columns.
+    #' @param comparison data.frame - One manifest row describing this comparison.
+
+    corr_matrix <- build_correlation_matrix(
+        corr_long_df,
+        min_pairs = comparison$min_pairs_required
+    )
+
+    if (nrow(corr_matrix) == 0L || ncol(corr_matrix) == 0L) {
+        message(
+            "Skipping comparison with no defined correlations: ",
+            comparison$correlation_file
+        )
+        return(invisible(NULL))
+    }
+
+    # Title: what was compared, then how it was imaged and who it covers
+    cohort_label <- if (comparison$cohort == "all_patients") {
+        "All patients"
+    } else {
+        comparison$cohort
+    }
+
+    projection_label <- unname(projection_labels[comparison$projection])
+    if (is.na(projection_label)) projection_label <- comparison$projection
+
+    # MorphEM is a 2D embedding, so that comparison is 2D vs. 2D
+    is_morphem <- comparison$profile_type == "sc_nucleocentric_morphem"
+    comparison_title <- if (is_morphem) {
+        "2D handcrafted vs. 2D nucleocentric (MorphEM/CHAMMI-75)"
+    } else {
+        paste0("2D vs. 3D: ", comparison$profile_label)
+    }
+
+    plot_title <- paste0(
+        comparison_title, "\n", projection_label, " | ", cohort_label
     )
 
     # Create the heatmap
     ht <- Heatmap(
         corr_matrix,
-        name = "Pearson\nCorrelation",
-        col = col_fun,
+        name = "Pearson r",
 
-        # Clustering
-        cluster_rows = TRUE,
-        cluster_columns = TRUE,
-        clustering_distance_rows = "euclidean",
-        clustering_distance_columns = "euclidean",
-        clustering_method_rows = "ward.D2",
-        clustering_method_columns = "ward.D2",
+        # Color scale from red (-1) to white (0) to blue (1)
+        col = colorRamp2(
+            c(-1, 0, 1),
+            c("#B2182B", "white", "#2166AC")
+        ),
+        na_col = "white",
+        border = TRUE,
 
-        # Hide individual feature labels
-        show_row_names = FALSE,
-        show_column_names = FALSE,
+        # Clustering, skipped where there is only one feature to order
+        cluster_rows = if (nrow(corr_matrix) > 1L) {
+            cluster_correlation_matrix
+        } else {
+            FALSE
+        },
+        cluster_columns = if (ncol(corr_matrix) > 1L) {
+            cluster_correlation_matrix
+        } else {
+            FALSE
+        },
+
+        # Only label features when there are few enough to read
+        show_row_names = nrow(corr_matrix) <= 30L,
+        show_column_names = ncol(corr_matrix) <= 30L,
+        row_names_gp = gpar(fontsize = 7),
+        column_names_gp = gpar(fontsize = 7),
 
         # Axis labels
-        row_title = "2D Features",
-        row_title_side = "left",
-        column_title = "3D Features",
+        row_title = if (is_morphem) "2D handcrafted features" else "2D features",
+        column_title = if (is_morphem) {
+            "2D nucleocentric features"
+        } else {
+            "3D features"
+        },
         column_title_side = "bottom",
-
-        # Dendrogram styling
-        show_row_dend = TRUE,
-        show_column_dend = TRUE,
-        row_dend_width = unit(15, "mm"),
-        column_dend_height = unit(15, "mm"),
+        row_title_gp = gpar(fontsize = 14),
+        column_title_gp = gpar(fontsize = 14),
 
         # Legend
         heatmap_legend_param = list(
-            title = "Pearson\nCorrelation",
             at = c(-1, -0.5, 0, 0.5, 1),
-            labels = c("-1", "-0.5", "0", "0.5", "1"),
-            legend_height = unit(4, "cm")
+            title_gp = gpar(fontsize = 12),
+            labels_gp = gpar(fontsize = 9)
         ),
         use_raster = TRUE,
-        raster_quality = 3
-    )
-
-    # Save to file
-    png(
-        output_path,
-        width = 12,
-        height = 10,
-        units = "in",
-        res = 300
+        raster_quality = 3,
+        raster_by_magick = FALSE,
+        raster_resize_mat = FALSE
     )
 
     # Draw with main title at top
     draw(
         ht,
-        column_title = sprintf(
-            "Pearson Correlation: 2D vs 3D Features — %s — %s",
-            patient_id, profile_type
-        ),
-        column_title_gp = gpar(fontsize = 14, fontface = "bold")
+        column_title = plot_title,
+        column_title_gp = gpar(fontsize = 14),
+        padding = unit(c(5, 5, 5, 5), "mm")
     )
 
-    dev.off()
-    cat(sprintf("  Saved: %s\n", output_path))
+    cat(sprintf("  Plotted: %s\n", comparison$correlation_file))
 }
 
-#Organoid heatmaps
-organoid_files <- list.files(results_dir, pattern = "_organoid_agg_correlation\\.parquet$", full.names = TRUE)
+# %%
+# Plot comparisons from the correlation manifest
+manifest <- as.data.frame(arrow::read_parquet(manifest_path))
 
-for (f in organoid_files) {
-    # Extract patient ID from filename
-    patient_id <- gsub("_organoid_agg_correlation\\.parquet$", "", basename(f))
-
-    corr_data <- arrow::read_parquet(f)
-
-    output_path <- file.path(figures_dir, sprintf("%s_organoid_heatmap.png", patient_id))
-
-    plot_correlation_heatmap(
-        corr_long_df = corr_data,
-        patient_id = patient_id,
-        profile_type = "Organoid",
-        output_path = output_path
-    )
+if (!is.null(projections_to_plot)) {
+    manifest <- manifest[manifest$projection %in% projections_to_plot, , drop = FALSE]
+}
+if (!is.null(profile_types_to_plot)) {
+    manifest <- manifest[
+        manifest$profile_type %in% profile_types_to_plot, ,
+        drop = FALSE
+    ]
+}
+if (!is.null(cohorts_to_plot)) {
+    manifest <- manifest[manifest$cohort %in% cohorts_to_plot, , drop = FALSE]
 }
 
-#SC heatmaps
-sc_files <- list.files(results_dir, pattern = "_sc_agg_correlation\\.parquet$", full.names = TRUE)
+cat(sprintf("Plotting %d comparisons\n", nrow(manifest)))
 
-for (f in sc_files) {
-    patient_id <- gsub("_sc_agg_correlation\\.parquet$", "", basename(f))
+# One page per comparison, in manifest order
+pdf(pdf_path, width = 11, height = 8.5, onefile = TRUE)
 
-    corr_data <- arrow::read_parquet(f)
+for (i in seq_len(nrow(manifest))) {
+    comparison <- manifest[i, , drop = FALSE]
 
-    output_path <- file.path(figures_dir, sprintf("%s_sc_heatmap.png", patient_id))
+    corr_data <- as.data.frame(arrow::read_parquet(
+        file.path(results_dir, comparison$correlation_file)
+    ))
 
-    plot_correlation_heatmap(
-        corr_long_df = corr_data,
-        patient_id = patient_id,
-        profile_type = "Single Cell",
-        output_path = output_path
-    )
+    plot_correlation_heatmap(corr_data, comparison)
 }
+
+dev.off()
+
+cat(sprintf("Saved: %s\n", pdf_path))
