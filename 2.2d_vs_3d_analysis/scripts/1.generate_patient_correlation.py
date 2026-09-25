@@ -8,10 +8,7 @@ import pathlib
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from notebook_init_utils import init_notebook
-from scipy.stats import pearsonr
 
 root_dir, in_notebook = init_notebook()
 
@@ -42,20 +39,23 @@ PATIENT_TUMORS = None  # None = every shared patient/tumor; or a list of IDs.
 INCLUDE_ALL_PATIENTS = True  # Pools every shared, non-excluded sample.
 EXCLUDED_PATIENT_TUMORS = ("NF0037_T1_CQ1",)
 OUTLIER_CUTOFF = 100
-MIN_PAIRS = 3  # A validity floor, not evidence of a reliable estimate.
-FEATURE_BLOCK_SIZE = 128
 
-# Wells are matched on these keys, and these annotations travel with them
-MATCH_KEYS = ["Metadata_patient_tumor", "Metadata_Well"]
-ANNOTATION_COLUMNS = ["Metadata_treatment", "Metadata_dose", "Metadata_dose_unit"]
+# Wells are matched on these keys, and these annotations travel with them.
+# 2D and 3D profiles use different metadata naming conventions; 3D's is the
+# canonical one here, so 2D's columns are renamed up to match it.
+MATCH_KEYS = ["Metadata_Biology_PatientTumor", "Metadata_Experiment_Well"]
+ANNOTATION_COLUMNS = [
+    "Metadata_Experiment_Treatment",
+    "Metadata_Experiment_Dose",
+    "Metadata_Experiment_Unit",
+]
 
-# The 3D profiles use a different metadata naming convention than the 2D ones
-METADATA_3D_RENAME = {
-    "Metadata_Biology_PatientTumor": "Metadata_patient_tumor",
-    "Metadata_Experiment_Well": "Metadata_Well",
-    "Metadata_Experiment_Treatment": "Metadata_treatment",
-    "Metadata_Experiment_Dose": "Metadata_dose",
-    "Metadata_Experiment_Unit": "Metadata_dose_unit",
+METADATA_2D_RENAME = {
+    "Metadata_patient_tumor": "Metadata_Biology_PatientTumor",
+    "Metadata_Well": "Metadata_Experiment_Well",
+    "Metadata_treatment": "Metadata_Experiment_Treatment",
+    "Metadata_dose": "Metadata_Experiment_Dose",
+    "Metadata_dose_unit": "Metadata_Experiment_Unit",
 }
 
 # %%
@@ -96,7 +96,7 @@ def load_profile(path: pathlib.Path, dimension: str) -> tuple[pd.DataFrame, dict
     path : pathlib.Path
         Path to the aggregated profile parquet file.
     dimension : str
-        Either "2D" or "3D". 3D metadata columns are renamed to the 2D
+        Either "2D" or "3D". 2D metadata columns are renamed to the 3D
         convention so both profiles can be matched on the same keys.
 
     Returns
@@ -106,12 +106,14 @@ def load_profile(path: pathlib.Path, dimension: str) -> tuple[pd.DataFrame, dict
         a summary of the feature cleanup.
     """
     df = pd.read_parquet(path)
-    if dimension == "3D":
-        df = df.rename(columns=METADATA_3D_RENAME)
+    if dimension == "2D":
+        df = df.rename(columns=METADATA_2D_RENAME)
 
     # Drop excluded samples before counting anything
     n_input_wells = len(df)
-    df = df.loc[~df["Metadata_patient_tumor"].isin(EXCLUDED_PATIENT_TUMORS)].copy()
+    df = df.loc[
+        ~df["Metadata_Biology_PatientTumor"].isin(EXCLUDED_PATIENT_TUMORS)
+    ].copy()
 
     features = [col for col in df if not col.startswith("Metadata_")]
     texture_features = [col for col in features if "_Texture_" in col]
@@ -197,155 +199,37 @@ def match_profiles(
 
 
 # %% [markdown]
-# ## Calculate Pearson correlations and valid pair counts
+# ## Calculate Pearson correlations
 
 
 # %%
-def standardize(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def standardize(arr: np.ndarray) -> np.ndarray:
     """
-    Center each column and scale it to unit norm, ignoring missing values.
+    Perform standard scalar normalization on the input array.
     This is NA aware!
-
-    Missing values are filled with 0 after centering, which drops them from the
-    dot products used to build the correlations. The returned mask records where
-    the real observations were, so pair counts can be recovered per feature pair.
 
     Parameters
     ----------
-    values : np.ndarray
+    arr : np.ndarray
         The input array to be normalized in the following dimensionality: (nxm)
 
     Returns
     ----------
-    tuple[np.ndarray, np.ndarray]
-        The centered, unit-norm array of the same dimensionality (nxm), and the
-        matching finite-observation mask (nxm) as floats.
+    np.ndarray
+        The standard scalar normalized array of the same dimensionality (nxm)
     """
-    finite = np.isfinite(values)
-    counts = finite.sum(axis=0)
-    means = np.divide(
-        np.where(finite, values, 0).sum(axis=0),
-        counts,
-        out=np.zeros(values.shape[1]),
-        where=counts > 0,
-    )
-    centered = np.where(finite, values - means, 0)
-    norms = np.linalg.norm(centered, axis=0)
-
-    # Repeated decimals can have tiny nonzero residuals after mean subtraction,
-    # so constant columns are found on the raw values instead of their norm
-    constant = np.where(finite, values, np.inf).min(axis=0) >= np.where(
-        finite, values, -np.inf
-    ).max(axis=0)
-    norms[constant] = 0
-
-    centered = np.divide(centered, norms, out=np.zeros_like(centered), where=norms > 0)
-    return centered, finite.astype(float)
+    mean = np.nanmean(arr, axis=0)
+    std = np.nanstd(arr, axis=0, ddof=0)
+    std = np.where(std == 0, np.nan, std)
+    return (arr - mean) / std
 
 
-def correlation_blocks(
-    features_2d: pd.DataFrame,
-    features_3d: pd.DataFrame,
-    min_pairs: int = MIN_PAIRS,
-    block_size: int = FEATURE_BLOCK_SIZE,
-):
-    """
-    Yield long-form Pearson correlations and their finite pair counts, a block
-    of 2D features at a time.
-
-    The full matrix of every 2D feature against every 3D feature is too large to
-    hold at once, so it is built with matrix products over blocks of 2D features
-    and streamed out block by block.
-
-    Parameters
-    ----------
-    features_2d : pd.DataFrame
-        2D feature columns, one row per matched well.
-    features_3d : pd.DataFrame
-        3D feature columns, with the same rows in the same order.
-    min_pairs : int, optional
-        Minimum number of finite pairs a correlation needs to be reported.
-    block_size : int, optional
-        Number of 2D features correlated per block.
-
-    Yields
-    ----------
-    pd.DataFrame
-        Long-form feature_2d, feature_3d, pearson_r, and n_pairs for one block.
-    """
-    assert len(features_2d) == len(features_3d), (
-        "Feature tables must have the same aligned observations"
-    )
-
-    raw_x = features_2d.to_numpy(dtype=float)
-    raw_y = features_3d.to_numpy(dtype=float)
-    x, mask_x = standardize(raw_x)
-    y, mask_y = standardize(raw_y)
-
-    # With no missing values every pair shares every well, which allows the
-    # cheaper form below
-    complete = bool(mask_x.all() and mask_y.all())
-
-    for start in range(0, x.shape[1], block_size):
-        block = slice(start, start + block_size)
-        xb, mask_xb = x[:, block], mask_x[:, block]
-
-        if complete:
-            counts = np.full((xb.shape[1], y.shape[1]), len(x), dtype=np.int32)
-            numerator = xb.T @ y
-            var_x = (xb**2).sum(axis=0)[:, None]
-            var_y = (y**2).sum(axis=0)[None, :]
-        else:
-            # Each feature pair is centered on its own overlap
-            counts = (mask_xb.T @ mask_y).astype(np.int32)
-            safe_counts = np.maximum(counts, 1)
-            sums_x, sums_y = xb.T @ mask_y, mask_xb.T @ y
-            numerator = xb.T @ y - sums_x * sums_y / safe_counts
-            var_x = (xb**2).T @ mask_y - sums_x**2 / safe_counts
-            var_y = mask_xb.T @ (y**2) - sums_y**2 / safe_counts
-
-        denominator = np.sqrt(np.maximum(var_x, 0) * np.maximum(var_y, 0))
-        valid = (counts >= min_pairs) & (denominator > 0)
-        correlations = np.divide(
-            numerator,
-            denominator,
-            out=np.full(numerator.shape, np.nan),
-            where=valid,
-        )
-
-        if not complete:
-            # A feature may be constant only on its overlap with another.
-            # Recalculate cancellation-prone pairs directly on that overlap.
-            unstable = (
-                (counts >= min_pairs)
-                & ((var_x < 1e-12) | (var_y < 1e-12))
-                & (xb != 0).any(axis=0)[:, None]
-                & (y != 0).any(axis=0)[None, :]
-            )
-            for i, j in zip(*np.where(unstable)):
-                paired = (mask_xb[:, i] > 0) & (mask_y[:, j] > 0)
-                a, b = raw_x[paired, start + i], raw_y[paired, j]
-                correlations[i, j] = (
-                    pearsonr(a, b).statistic
-                    if np.ptp(a) > 0 and np.ptp(b) > 0
-                    else np.nan
-                )
-
-        yield pd.DataFrame(
-            {
-                "feature_2d": np.repeat(features_2d.columns[block], y.shape[1]),
-                "feature_3d": np.tile(features_3d.columns, xb.shape[1]),
-                "pearson_r": np.clip(correlations, -1, 1).ravel(),
-                "n_pairs": counts.ravel(),
-            }
-        )
-
-
-def save_correlation(
+def compute_and_save_correlation(
     features_2d: pd.DataFrame, features_3d: pd.DataFrame, output_path: pathlib.Path
 ) -> dict:
     """
-    Stream a complete 2D vs. 3D correlation matrix to a long-form parquet file.
+    Compute pairwise Pearson correlations between 2D and 3D features and save
+    the results as a long-form parquet file.
 
     Parameters
     ----------
@@ -361,39 +245,35 @@ def save_correlation(
     dict
         A summary of the saved matrix, for the manifest.
     """
-    schema = pa.schema(
-        [
-            ("feature_2d", pa.string()),
-            ("feature_3d", pa.string()),
-            ("pearson_r", pa.float64()),
-            ("n_pairs", pa.int32()),
-        ]
+    features_2d_cols = list(features_2d.columns)
+    features_3d_cols = list(features_3d.columns)
+
+    arr_2d_z = standardize(features_2d.values)
+    arr_3d_z = standardize(features_3d.values)
+
+    # Compute correlation via a single .corr() call, then slice out the
+    # 2D-vs-3D cross block (pandas handles missing values pairwise already)
+    df_2d_std = pd.DataFrame(arr_2d_z, columns=features_2d_cols)
+    df_3d_std = pd.DataFrame(arr_3d_z, columns=features_3d_cols)
+    combined = pd.concat([df_2d_std, df_3d_std], axis=1)
+    full_corr = combined.corr(method="pearson")
+    corr_matrix = full_corr.loc[features_2d_cols, features_3d_cols].values
+
+    # Convert to long-form and save
+    corr_df = pd.DataFrame(
+        corr_matrix, index=features_2d_cols, columns=features_3d_cols
     )
-
-    n_defined = 0
-    min_n_pairs, max_n_pairs = len(features_2d), 0
-
-    # Written block by block so the whole matrix never has to be in memory
-    with pq.ParquetWriter(output_path, schema, compression="zstd") as writer:
-        for block in correlation_blocks(
-            features_2d,
-            features_3d,
-            min_pairs=MIN_PAIRS,
-            block_size=FEATURE_BLOCK_SIZE,
-        ):
-            writer.write_table(
-                pa.Table.from_pandas(block, schema=schema, preserve_index=False)
-            )
-            n_defined += int(block["pearson_r"].notna().sum())
-            min_n_pairs = min(min_n_pairs, int(block["n_pairs"].min()))
-            max_n_pairs = max(max_n_pairs, int(block["n_pairs"].max()))
+    corr_long = (
+        corr_df.reset_index()
+        .melt(id_vars="index", var_name="feature_3d", value_name="pearson_r")
+        .rename(columns={"index": "feature_2d"})
+    )
+    corr_long.to_parquet(output_path, index=False)
 
     return {
-        "n_features_2d": features_2d.shape[1],
-        "n_features_3d": features_3d.shape[1],
-        "n_defined_correlations": n_defined,
-        "min_n_pairs": min_n_pairs,
-        "max_n_pairs": max_n_pairs,
+        "n_features_2d": len(features_2d_cols),
+        "n_features_3d": len(features_3d_cols),
+        "n_defined_correlations": int(corr_long["pearson_r"].notna().sum()),
     }
 
 
@@ -426,7 +306,7 @@ for projection in PROJECTIONS:
         pair_dir.mkdir(parents=True, exist_ok=True)
         audit.to_parquet(pair_dir / "matched_wells.parquet", index=False)
 
-        for patient_tumor, group in audit.groupby("Metadata_patient_tumor"):
+        for patient_tumor, group in audit.groupby("Metadata_Biology_PatientTumor"):
             counts = group["match_status"].value_counts()
             matching_summaries.append(
                 {
@@ -440,7 +320,9 @@ for projection in PROJECTIONS:
             )
 
         # Correlate each patient/tumor on its own, and optionally all pooled
-        shared_patient_tumors = sorted(aligned_2d["Metadata_patient_tumor"].unique())
+        shared_patient_tumors = sorted(
+            aligned_2d["Metadata_Biology_PatientTumor"].unique()
+        )
         if PATIENT_TUMORS is not None:
             missing = set(PATIENT_TUMORS) - set(shared_patient_tumors)
             if missing:
@@ -463,10 +345,12 @@ for projection in PROJECTIONS:
             if cohort == "all_patients":
                 selected = np.ones(len(aligned_2d), dtype=bool)
             else:
-                selected = aligned_2d["Metadata_patient_tumor"].eq(cohort).to_numpy()
+                selected = (
+                    aligned_2d["Metadata_Biology_PatientTumor"].eq(cohort).to_numpy()
+                )
 
             output_path = pair_dir / f"{cohort}_correlation.parquet"
-            summary = save_correlation(
+            summary = compute_and_save_correlation(
                 aligned_2d.loc[selected, features_2d],
                 aligned_3d.loc[selected, features_3d],
                 output_path,
@@ -480,7 +364,6 @@ for projection in PROJECTIONS:
                     "cohort": cohort,
                     "analysis_unit": "patient_tumor_well_aggregate",
                     "n_matched_wells": int(selected.sum()),
-                    "min_pairs_required": MIN_PAIRS,
                     "correlation_file": str(output_path.relative_to(results_dir)),
                     **summary,
                 }

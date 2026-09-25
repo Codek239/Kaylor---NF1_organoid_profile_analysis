@@ -66,20 +66,12 @@ projection_labels <- c(
 )
 
 # %%
-build_correlation_matrix <- function(corr_long_df, min_pairs) {
-    #' Pivot long-form correlations into a 2D x 3D matrix, blanking out any
-    #' correlation that rests on too few wells.
+build_correlation_matrix <- function(corr_long_df) {
+    #' Pivot long-form correlations into a 2D x 3D matrix.
     #'
-    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r, n_pairs columns.
-    #' @param min_pairs numeric - Minimum finite well pairs a correlation needs to be kept.
+    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r columns.
     #'
     #' @return matrix - Pearson correlations with 2D features as rows and 3D features as columns.
-
-    # Correlations from too few wells are not trustworthy, so blank them out
-    # rather than letting them drive the colors or the clustering
-    corr_long_df$pearson_r[
-        !is.finite(corr_long_df$pearson_r) | corr_long_df$n_pairs < min_pairs
-    ] <- NA_real_
 
     features_2d <- sort(unique(corr_long_df$feature_2d))
     features_3d <- sort(unique(corr_long_df$feature_3d))
@@ -170,20 +162,17 @@ plot_correlation_heatmap <- function(corr_long_df, comparison) {
     #' Draw a clustered heatmap of Pearson correlations between 2D and 3D
     #' features onto the open graphics device.
     #'
-    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r, n_pairs columns.
+    #' @param corr_long_df data.frame - Long-form data with feature_2d, feature_3d, pearson_r columns.
     #' @param comparison data.frame - One manifest row describing this comparison.
 
-    corr_matrix <- build_correlation_matrix(
-        corr_long_df,
-        min_pairs = comparison$min_pairs_required
-    )
+    corr_matrix <- build_correlation_matrix(corr_long_df)
 
     if (nrow(corr_matrix) == 0L || ncol(corr_matrix) == 0L) {
         message(
             "Skipping comparison with no defined correlations: ",
             comparison$correlation_file
         )
-        return(invisible(NULL))
+        return(invisible(FALSE))
     }
 
     # Title: what was compared, then how it was imaged and who it covers
@@ -271,6 +260,7 @@ plot_correlation_heatmap <- function(corr_long_df, comparison) {
     )
 
     cat(sprintf("  Plotted: %s\n", comparison$correlation_file))
+    invisible(TRUE)
 }
 
 # %%
@@ -292,8 +282,12 @@ if (!is.null(cohorts_to_plot)) {
 
 cat(sprintf("Plotting %d comparisons\n", nrow(manifest)))
 
-# One page per comparison, in manifest order
-pdf(pdf_path, width = 11, height = 8.5, onefile = TRUE)
+# Each comparison is rendered to its own single-page PDF, then merged into one
+# file with Ghostscript -- Jupyter's R kernel collapses every page onto the
+# first if drawn into one long-lived pdf() device instead.
+page_dir <- file.path(tempdir(), "correlation_heatmap_pages")
+dir.create(page_dir, showWarnings = FALSE)
+page_paths <- character(0)
 
 for (i in seq_len(nrow(manifest))) {
     comparison <- manifest[i, , drop = FALSE]
@@ -302,9 +296,36 @@ for (i in seq_len(nrow(manifest))) {
         file.path(results_dir, comparison$correlation_file)
     ))
 
-    plot_correlation_heatmap(corr_data, comparison)
+    page_path <- file.path(page_dir, sprintf("page_%03d.pdf", i))
+    pdf(page_path, width = 11, height = 8.5, onefile = FALSE)
+    plotted <- plot_correlation_heatmap(corr_data, comparison)
+    dev.off()
+
+    if (isTRUE(plotted)) {
+        page_paths <- c(page_paths, page_path)
+    } else {
+        unlink(page_path)
+    }
 }
 
-dev.off()
+# Merge every page into one combined PDF, in manifest order
+gs_bin <- Sys.which("gs")
+if (gs_bin == "") {
+    gs_candidate <- file.path(dirname(dirname(R.home())), "bin", "gs")
+    if (file.exists(gs_candidate)) gs_bin <- gs_candidate
+}
+if (gs_bin == "" || length(page_paths) == 0L) {
+    stop("Ghostscript (gs) not found, or no pages were plotted; cannot merge.")
+}
+status <- system2(
+    gs_bin,
+    c(
+        "-dBATCH", "-dNOPAUSE", "-q", "-sDEVICE=pdfwrite",
+        paste0("-sOutputFile=", pdf_path), page_paths
+    )
+)
+if (status != 0L) stop("Ghostscript failed to merge the heatmap pages.")
+
+unlink(page_dir, recursive = TRUE)
 
 cat(sprintf("Saved: %s\n", pdf_path))
